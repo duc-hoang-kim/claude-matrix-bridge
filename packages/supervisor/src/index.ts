@@ -93,6 +93,14 @@ const activeSessions = getActiveSessions(db)
 if (activeSessions.length > 0) {
   logger.info({ count: activeSessions.length }, 'Restoring active sessions')
   for (const session of activeSessions) {
+    // Old plaintext rooms cannot safely carry code or permission decisions.
+    if (!session.room_id) continue
+    try { await client.getRoomStateEvent(session.room_id, 'm.room.encryption', '') }
+    catch {
+      updateSession(db, session.id, { status: 'detached', port: null, pid: null })
+      logger.warn({ session: session.name }, 'Refusing to restore unencrypted room')
+      continue
+    }
     // Skip sessions whose JSONL has no real turns — claude --resume would die
     // seconds after spawn on an effectively-empty session. See #22.
     if (!hasUserActivity(session.id, session.working_directory)) {
