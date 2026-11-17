@@ -1,0 +1,40 @@
+name: Hardened bridge checks
+on:
+  push:
+    branches: [security/hardening]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  supervisor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Reproducible dependency install
+        working-directory: packages/supervisor
+        run: npm ci
+      - name: TypeScript compile
+        working-directory: packages/supervisor
+        run: npx tsc --noEmit
+      - name: Unit tests
+        working-directory: packages/supervisor
+        run: npm test
+      - name: Dependency audit
+        working-directory: packages/supervisor
+        run: npm audit --omit=dev --audit-level=high
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install frozen relay dependency versions
+        working-directory: packages/matrix-relay
+        run: bun install --frozen-lockfile
+      - name: Typecheck relay
+        working-directory: packages/matrix-relay
+        run: bunx tsc --noEmit
