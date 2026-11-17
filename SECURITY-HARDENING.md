@@ -49,3 +49,7 @@ Use a **new bot Matrix device and new encrypted rooms**. Existing unencrypted ro
 **Claude can execute project code.** Approving Bash and development hooks can execute arbitrary code with the Claude OS user's privileges, regardless of this bridge's permission checks.
 
 This is not a formal penetration test. The branch is intended for review and iterative CI fixes.
+
+## Dependency audit gating (2026-11-17)
+
+The dependency audit identified **16 production vulnerability records (3 critical, 5 high, 8 moderate)**, including an unsupported `request` / `request-promise` dependency chain pulled in by `matrix-bot-sdk`. Several have no patched version. Because a full Matrix SDK migration is required to eliminate those, CI now uploads the complete `npm audit` JSON artifact, prints a prominent warning, and **fails on newly vulnerable packages or increased severity counts compared with the audited baseline**. Passing CI does **not** indicate dependencies are secure. Do not merge or deploy while critical findings remain unremediated.
