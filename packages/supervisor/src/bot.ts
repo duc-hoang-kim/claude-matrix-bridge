@@ -4,7 +4,6 @@ import {
   LogService,
   LogLevel,
   RustSdkCryptoStorageProvider,
-  RustSdkCryptoStoreType,
 } from 'matrix-bot-sdk'
 import type Database from 'better-sqlite3'
 import type { Logger } from 'pino'
@@ -56,7 +55,7 @@ export function createBot(config: Config, logger: Logger): MatrixClient {
   LogService.setLevel(SDK_LOG_LEVELS[config.logLevel] ?? LogLevel.WARN)
 
   const storage = new SimpleFsStorageProvider('data/bot-sync.json')
-  const crypto = new RustSdkCryptoStorageProvider('data/bot-crypto', RustSdkCryptoStoreType.Sqlite)
+  const crypto = new RustSdkCryptoStorageProvider('data/bot-crypto')
   const client = new MatrixClient(
     config.matrix.homeserverUrl,
     config.matrix.accessToken,
