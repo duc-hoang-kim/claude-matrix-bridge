@@ -3,6 +3,8 @@ import {
   SimpleFsStorageProvider,
   LogService,
   LogLevel,
+  RustSdkCryptoStorageProvider,
+  RustSdkCryptoStoreType,
 } from 'matrix-bot-sdk'
 import type Database from 'better-sqlite3'
 import type { Logger } from 'pino'
@@ -32,6 +34,17 @@ import {
   safeSetTyping,
 } from './matrix-send.js'
 
+const ENCRYPTION_STATE = [{
+  type: 'm.room.encryption',
+  state_key: '',
+  content: { algorithm: 'm.megolm.v1.aes-sha2' },
+}]
+
+async function assertEncrypted(client: MatrixClient, roomId: string): Promise<void> {
+  try { await client.getRoomStateEvent(roomId, 'm.room.encryption', '') }
+  catch { throw new Error('Refusing plaintext Matrix room ' + roomId + '; create a new encrypted room') }
+}
+
 const SDK_LOG_LEVELS: Record<string, LogLevel> = {
   debug: LogLevel.DEBUG,
   info: LogLevel.INFO,
@@ -43,10 +56,12 @@ export function createBot(config: Config, logger: Logger): MatrixClient {
   LogService.setLevel(SDK_LOG_LEVELS[config.logLevel] ?? LogLevel.WARN)
 
   const storage = new SimpleFsStorageProvider('data/bot-sync.json')
+  const crypto = new RustSdkCryptoStorageProvider('data/bot-crypto', RustSdkCryptoStoreType.Sqlite)
   const client = new MatrixClient(
     config.matrix.homeserverUrl,
     config.matrix.accessToken,
     storage,
+    crypto,
   )
 
   logger.info('Matrix client created')
@@ -102,6 +117,7 @@ export async function bootstrapSpaceAndRooms(
         preset: 'private_chat',
         room_alias_name: 'claude-control',
         invite: [config.matrix.ownerUserId],
+        initial_state: ENCRYPTION_STATE,
       })
     }
     setConfig(db, 'control_room_id', controlRoomId)
@@ -121,6 +137,8 @@ export async function bootstrapSpaceAndRooms(
       // Already linked or no permission — ignore
     }
   }
+
+  await assertEncrypted(client, controlRoomId)
 
   // Ensure owner is invited to both space and control room.
   // Check membership first (GET, not rate-limited) so we don't burn
@@ -413,6 +431,7 @@ async function autoAttachSession(
   if (!roomId) return
 
   const wasLocal = session.status === 'local_active'
+  await assertEncrypted(client, roomId)
 
   // Allocate a fresh port — the old port (if any) may be stale or reused.
   const port = nextFreePort(db, config.ports.start, config.ports.end)
