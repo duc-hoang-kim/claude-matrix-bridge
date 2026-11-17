@@ -8,6 +8,7 @@ export interface Config {
     accessToken: string;
     botUserId: string;
     ownerUserId: string;
+    e2ee: boolean;
   };
   claude: {
     model: string;
@@ -41,6 +42,12 @@ export function loadConfig(): Config {
   const __dirname = dirname(fileURLToPath(import.meta.url));
   const repoRoot = resolve(__dirname, "..", "..", "..");
   dotenv.config({ path: resolve(repoRoot, ".env") });
+  if (!/^[a-f0-9]{64}$/i.test(process.env.CMB_RELAY_SECRET ?? "")) {
+    throw new Error("Missing 32-byte CMB_RELAY_SECRET; run mise run setup");
+  }
+  if (process.env.MATRIX_ENABLE_E2EE !== "true") {
+    throw new Error("MATRIX_ENABLE_E2EE=true is mandatory for this hardened fork");
+  }
 
   return {
     matrix: {
@@ -48,6 +55,7 @@ export function loadConfig(): Config {
       accessToken: requireEnv("MATRIX_ACCESS_TOKEN"),
       botUserId: requireEnv("MATRIX_BOT_USER_ID"),
       ownerUserId: requireEnv("MATRIX_OWNER_USER_ID"),
+      e2ee: true,
     },
     claude: {
       model: process.env.CLAUDE_MODEL ?? "sonnet",
