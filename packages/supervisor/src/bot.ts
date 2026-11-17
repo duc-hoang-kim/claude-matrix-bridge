@@ -273,7 +273,7 @@ async function sendPermissionVerdict(
   db: Database.Database,
   logger: Logger,
 ): Promise<void> {
-  await sendPermission(port, permReq.request_id, behavior)
+  await sendPermission(port, permReq.request_id, behavior, permReq.session_id)
   resolvePermissionRequest(db, permReq.request_id, behavior === 'allow' ? 'allowed' : 'denied')
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await client.sendText(roomId, `${label} — ${permReq.tool_name}`)
@@ -440,7 +440,7 @@ async function autoAttachSession(
     },
   })
 
-  const healthy = await waitForHealth(port, logger, 30000)
+  const healthy = await waitForHealth(port, logger, session.id, 30000)
   if (!healthy) {
     try {
       await killClaude(updated, logger)
@@ -459,6 +459,7 @@ async function autoAttachSession(
     (event) => handleSSEEvent(event, { ...updated, status: 'active' }, client, db, logger),
     (err) => logger.error({ err, session: session.name }, 'SSE connection error'),
     logger,
+    session.id,
   )
   startTaskMirror({ ...updated, status: 'active' }, client, db, config.matrix.botUserId, logger)
 
@@ -491,7 +492,7 @@ async function autoAttachSession(
   await new Promise(r => setTimeout(r, 2000))
 
   await safeSetTyping(client, roomId, true, logger)
-  await sendMessage(port, sender, body)
+  await sendMessage(port, sender, body, session.id)
 }
 
 // --- Session room message handler ---
@@ -568,7 +569,7 @@ function handleSessionRoomMessage(
   void (async () => {
     try {
       await safeSetTyping(client, roomId, true, logger)
-      await sendMessage(port, sender, body)
+      await sendMessage(port, sender, body, session.id)
     } catch (err) {
       logger.error({ err, session: session.name }, 'Failed to relay message')
       await safeSetTyping(client, roomId, false, logger)
@@ -647,7 +648,8 @@ export function setupEventHandlers(
     const behavior: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
     const session = getSessionByRoomId(db, roomId)
 
-    const sessionPort = session?.port
+    if (!session || session.id !== permReq.session_id) return
+    const sessionPort = session.port
     if (!sessionPort) return
 
     void (async () => {
