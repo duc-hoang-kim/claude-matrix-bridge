@@ -585,7 +585,7 @@ async function handleNew(
     logger.info({ name, workDir, port }, "Creating session");
     const roomId = await client.createRoom({
       name,
-      topic: 'Encrypted Claude session',,
+      topic: 'Encrypted Claude session',
       preset: "private_chat",
       invite: [config.matrix.ownerUserId],
       initial_state: [{ type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } }],
