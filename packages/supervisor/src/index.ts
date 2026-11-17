@@ -127,7 +127,7 @@ if (activeSessions.length > 0) {
         },
       })
 
-      const healthy = await waitForHealth(port, logger, 30000)
+      const healthy = await waitForHealth(port, logger, session.id, 30000)
       if (healthy) {
         updateSession(db, session.id, { status: 'active' })
         const active = { ...restored, status: 'active' as const }
@@ -136,6 +136,7 @@ if (activeSessions.length > 0) {
           (event) => handleSSEEvent(event, active, client, db, logger),
           (err) => logger.error({ err, session: active.name }, 'SSE connection error'),
           logger,
+          session.id,
         )
         startTaskMirror(active, client, db, config.matrix.botUserId, logger)
         logger.info({ session: active.name, port }, 'Session restored')
