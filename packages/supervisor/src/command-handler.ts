@@ -277,9 +277,10 @@ async function attachDiscovered(
 
     const roomId = await client.createRoom({
       name,
-      topic: `Claude session — ${discovered.cwd}`,
+      topic: 'Encrypted Claude session',
       preset: "private_chat",
       invite: [config.matrix.ownerUserId],
+      initial_state: [{ type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } }],
     });
 
     await addRoomToSpace(client, spaceId, roomId, domain, logger);
@@ -316,6 +317,9 @@ async function resumeSession(
   logger: Logger,
 ): Promise<string> {
   if (!isAllowedWorkDir(session.working_directory, config)) return "Directory outside allowed project root.";
+  if (!session.room_id) return "Session has no Matrix room.";
+  try { await client.getRoomStateEvent(session.room_id, 'm.room.encryption', '') }
+  catch { return "Refusing to resume into an unencrypted Matrix room."; }
   // Detached sessions may have stale ports; always allocate a new one.
   const port = nextFreePort(db, config.ports.start, config.ports.end);
   if (!port) return "No free ports available.";
@@ -581,9 +585,10 @@ async function handleNew(
     logger.info({ name, workDir, port }, "Creating session");
     const roomId = await client.createRoom({
       name,
-      topic: `Claude session — ${workDir}`,
+      topic: 'Encrypted Claude session',,
       preset: "private_chat",
       invite: [config.matrix.ownerUserId],
+      initial_state: [{ type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } }],
     });
 
     await addRoomToSpace(client, spaceId, roomId, domain, logger);
