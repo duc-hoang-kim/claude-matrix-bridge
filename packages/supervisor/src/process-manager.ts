@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { relayToken } from './security.js'
 import type { Logger } from 'pino'
 import type Database from 'better-sqlite3'
 import type { Session, UserPermissionMode } from './types.js'
@@ -127,10 +128,15 @@ export function spawnClaude(
       '-s', tmuxName,          // session name
       '-c', session.working_directory,  // working directory
       '-e', `RELAY_PORT=${session.port}`,
+      '-e', `RELAY_SESSION_ID=${session.id}`,
+      '-e', `RELAY_AUTH_TOKEN=${relayToken(session.id)}`,
       'claude', ...claudeArgs, // argument vector, never a shell command
     ), {
       encoding: 'utf-8',
       timeout: 10000,
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+        !key.startsWith('MATRIX_') && key !== 'CMB_RELAY_SECRET'
+      )),
     })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
