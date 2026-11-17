@@ -27,10 +27,6 @@ function tmuxSessionName(session: Session): string {
   return `claude-${session.name}`
 }
 
-function quoteArg(a: string): string {
-  return `'${a}'`
-}
-
 /**
  * Kill the entire dedicated tmux server. Used for recovery on startup
  * to guarantee a clean slate. Silent if the server doesn't exist.
@@ -81,6 +77,9 @@ export function spawnClaude(
   logger: Logger,
   options?: { resume?: boolean; onExit?: (code: number | null) => void },
 ): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(session.name)) {
+    throw new Error('Unsafe session name (letters, numbers, underscore and hyphen only)')
+  }
   const tmuxName = tmuxSessionName(session)
   const sessionLogger = logger.child({ session: session.name, port: session.port, tmux: tmuxName })
 
@@ -101,20 +100,12 @@ export function spawnClaude(
   }
 
   if (session.permission_mode === 'bypassPermissions') {
-    claudeArgs.push('--dangerously-skip-permissions')
-  } else {
-    // Always pass --permission-mode (even for 'default') so claude doesn't
-    // inherit a stale mode from the JSONL's last permission-mode record on
-    // resume. The DB is authoritative; this keeps the two in sync.
-    claudeArgs.push('--permission-mode', session.permission_mode)
+    throw new Error('Unsafe bypassPermissions mode is disabled')
   }
+  claudeArgs.push('--permission-mode', session.permission_mode)
 
-  // Construct the full command string for tmux
-  // RELAY_PORT is set as env var prefix so the channel plugin picks it up
-  const quotedArgs = claudeArgs.map(quoteArg).join(' ')
-  const claudeCmd = `RELAY_PORT=${session.port} claude ${quotedArgs}`
-
-  sessionLogger.info({ cwd: session.working_directory, claudeCmd }, 'Spawning Claude in tmux')
+  if (!session.port || !Number.isInteger(session.port)) throw new Error('Missing relay port')
+  sessionLogger.info({ cwd: session.working_directory, model: session.model }, 'Spawning Claude in tmux')
 
   // Kill stale tmux session with same name if it exists
   try {
@@ -135,7 +126,8 @@ export function spawnClaude(
       '-d',                    // detached
       '-s', tmuxName,          // session name
       '-c', session.working_directory,  // working directory
-      claudeCmd,               // command to run
+      '-e', `RELAY_PORT=${session.port}`,
+      'claude', ...claudeArgs, // argument vector, never a shell command
     ), {
       encoding: 'utf-8',
       timeout: 10000,
@@ -155,8 +147,6 @@ export function spawnClaude(
   // content so future unknown prompts surface immediately in the logs.
   void (async () => {
     const maxAttempts = 40 // 40 * 500ms = 20s max wait
-    let trustAnswered = false
-
     const sendEnter = (): void => {
       execFileSync('tmux', tmuxArgs('send-keys', '-t', tmuxName, 'Enter'), {
         encoding: 'utf-8',
@@ -188,11 +178,9 @@ export function spawnClaude(
       // contains "one you" between "or" and "trust" and is more likely to drift
       // across Claude Code versions. The option text "Yes, I trust this folder"
       // is the stable anchor.
-      if (!trustAnswered && pane.includes('Yes, I trust this folder')) {
-        sendEnter()
-        sessionLogger.info('Auto-confirmed trust prompt')
-        trustAnswered = true
-        continue // dev-channels prompt still to come
+      if (pane.includes('Yes, I trust this folder')) {
+        sessionLogger.warn('Project trust requires local manual approval in tmux')
+        return
       }
       if (pane.includes('I am using this for local development')) {
         sendEnter()
@@ -207,7 +195,7 @@ export function spawnClaude(
 
     const finalPane = capturePane()
     sessionLogger.warn(
-      { pane: finalPane?.slice(-500) ?? null, trustAnswered },
+      { pane: finalPane?.slice(-500) ?? null },
       'Spawn-polling timed out without reaching dev-channels prompt',
     )
   })()
