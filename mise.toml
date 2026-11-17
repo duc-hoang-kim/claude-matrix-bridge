@@ -7,7 +7,7 @@ description = "Install all dependencies"
 env = { NODE_ENV = "development" }
 run = """
 cd packages/matrix-relay && bun install
-cd ../../packages/supervisor && npm install
+cd ../../packages/supervisor && npm ci
 """
 
 [tasks.build]
@@ -56,6 +56,29 @@ if [ ! -f .env ]; then
 else
   echo "[INFO] .env already exists"
 fi
+# Generate secrets locally. Never commit .env or the hook token.
+node - <<'NODE'
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+let content = fs.readFileSync('.env', 'utf8')
+const replacement = crypto.randomBytes(32).toString('hex')
+if (/^CMB_RELAY_SECRET=/m.test(content)) {
+  content = content.replace(/^CMB_RELAY_SECRET=.*$/m, line =>
+    /^[a-f0-9]{64}$/i.test(line.slice(17)) ? line : 'CMB_RELAY_SECRET=' + replacement)
+} else {
+  content += '\\nCMB_RELAY_SECRET=' + replacement + '\\n'
+}
+if (!/^MATRIX_ENABLE_E2EE=/m.test(content)) content += '\\nMATRIX_ENABLE_E2EE=true\\n'
+fs.writeFileSync('.env', content, { mode: 0o600 })
+NODE
+chmod 600 .env
+TOKEN_DIR="$HOME/.config/claude-matrix-bridge"
+mkdir -p "$TOKEN_DIR"
+chmod 700 "$TOKEN_DIR"
+if [ ! -f "$TOKEN_DIR/handoff-token" ]; then
+  node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('hex'))" > "$TOKEN_DIR/handoff-token"
+fi
+chmod 600 "$TOKEN_DIR/handoff-token"
 echo ""
 echo "Setup complete!"
 """

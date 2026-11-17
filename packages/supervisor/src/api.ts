@@ -5,6 +5,7 @@ import type { Logger } from 'pino'
 import type { Config } from './config.js'
 import { getSessionById, updateSession } from './database.js'
 import { killClaude } from './process-manager.js'
+import { handoffToken, bearerValid } from './security.js'
 
 export interface ApiResult {
   status: number
@@ -14,12 +15,25 @@ export interface ApiResult {
 async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     let data = ''
-    req.on('data', (chunk: Buffer) => { data += chunk.toString() })
+    let total = 0
+    let tooLarge = false
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.byteLength
+      if (total > 8192) {
+        if (!tooLarge) reject(Object.assign(new Error('body too large'), { statusCode: 413 }))
+        tooLarge = true
+      } else {
+        data += chunk.toString()
+      }
+    })
     req.on('end', () => {
+      if (tooLarge) return
       try {
-        resolve(data ? JSON.parse(data) : {})
+        const parsed: unknown = data ? JSON.parse(data) : {}
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('JSON object expected')
+        resolve(parsed as Record<string, unknown>)
       } catch {
-        reject(new Error('Invalid JSON'))
+        reject(Object.assign(new Error('Invalid JSON'), { statusCode: 400 }))
       }
     })
     req.on('error', reject)
@@ -38,6 +52,7 @@ export function startApiServer(
   client: MatrixClient,
   logger: Logger,
 ): ReturnType<typeof createServer> {
+  const authToken = handoffToken()
   const server = createServer(async (req, res) => {
     const url = req.url ?? ''
     const method = req.method ?? ''
@@ -45,6 +60,11 @@ export function startApiServer(
     try {
       if (url === '/api/health' && method === 'GET') {
         json(res, 200, { status: 'ok' })
+        return
+      }
+
+      if (url.startsWith('/api/session/') && !bearerValid(req.headers.authorization, authToken)) {
+        json(res, 401, { error: 'unauthorized' })
         return
       }
 
@@ -65,7 +85,7 @@ export function startApiServer(
       json(res, 404, { error: 'not found' })
     } catch (err) {
       logger.error({ err }, 'API error')
-      json(res, 500, { error: 'internal error' })
+      json(res, (err as { statusCode?: number }).statusCode ?? 500, { error: 'request failed' })
     }
   })
 

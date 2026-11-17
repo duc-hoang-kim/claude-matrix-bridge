@@ -285,19 +285,9 @@ async function tick(
   const message = formatTasksAsMatrix(tasks)
   if (topic === null || topicHtml === null || message === null) return
 
-  try {
-    await client.sendStateEvent(current.room_id, 'm.room.topic', '', {
-      topic,
-      'm.topic': {
-        'm.text': [
-          { mimetype: 'text/html', body: topicHtml },
-          { mimetype: 'text/plain', body: topic },
-        ],
-      },
-    })
-  } catch (err) {
-    logger.warn({ err, session: current.name }, 'failed to update room topic')
-  }
+  // Topics are plaintext Matrix state even in E2EE rooms: never publish task content.
+  void topic
+  void topicHtml
 
   await upsertPinnedTaskMessage(client, db, current.room_id, sessionId, state.botUserId, message, logger)
 }

@@ -10,6 +10,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { timingSafeEqual } from 'node:crypto'
 
 // --- A. Constants ---
 
@@ -17,6 +18,39 @@ const RELAY_PORT = Number(process.env.RELAY_PORT)
 if (!RELAY_PORT || Number.isNaN(RELAY_PORT)) {
   process.stderr.write('matrix-relay: RELAY_PORT environment variable required\n')
   process.exit(1)
+}
+
+// All endpoints (including health) are restricted to this session.
+const RELAY_SESSION_ID = process.env.RELAY_SESSION_ID
+const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN
+if (!RELAY_SESSION_ID || !RELAY_AUTH_TOKEN || !/^[a-f0-9]{64}$/i.test(RELAY_AUTH_TOKEN)) {
+  throw new Error('RELAY_SESSION_ID and RELAY_AUTH_TOKEN are required')
+}
+function authorized(req: Request): boolean {
+  const actual = Buffer.from(req.headers.get('authorization') ?? '')
+  const expected = Buffer.from('Bearer ' + RELAY_AUTH_TOKEN)
+  return actual.length === expected.length && timingSafeEqual(actual, expected)
+}
+class BodyError extends Error {
+  constructor(readonly status: number, message: string) { super(message) }
+}
+async function readJson(req: Request): Promise<Record<string, unknown>> {
+  if (!req.body) throw new BodyError(400, 'Missing JSON body')
+  const reader = req.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    size += value.byteLength
+    if (size > 65536) { await reader.cancel(); throw new BodyError(413, 'Body too large') }
+    chunks.push(value)
+  }
+  let value: unknown
+  try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')) }
+  catch { throw new BodyError(400, 'Invalid JSON') }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new BodyError(400, 'JSON object required')
+  return value as Record<string, unknown>
 }
 
 // --- B. Global Error Handlers ---
@@ -163,18 +197,16 @@ await mcp.connect(new StdioServerTransport())
 
 async function handleMessage(req: Request): Promise<Response> {
   try {
-    const body = (await req.json()) as {
-      sender: string
-      content: string
-      message_id?: string
-    }
-    if (!body.sender || !body.content) {
+    const body = await readJson(req)
+    if (typeof body.sender !== 'string' || !body.sender || body.sender.length > 256 ||
+        typeof body.content !== 'string' || !body.content || body.content.length > 60000 ||
+        (body.message_id !== undefined && (typeof body.message_id !== 'string' || body.message_id.length > 256))) {
       return Response.json(
         { error: 'sender and content required' },
         { status: 400 },
       )
     }
-    const message_id = body.message_id ?? `msg_${Date.now()}`
+    const message_id = (body.message_id as string | undefined) ?? `msg_${Date.now()}`
     await sendNotification('notifications/claude/channel', {
       content: body.content,
       meta: {
@@ -188,14 +220,16 @@ async function handleMessage(req: Request): Promise<Response> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     process.stderr.write(`matrix-relay: /message error: ${msg}\n`)
-    return Response.json({ error: msg }, { status: 500 })
+    return Response.json({ error: msg }, { status: err instanceof BodyError ? err.status : 500 })
   }
 }
 
 function handleEvents(): Response {
   let keepalive: ReturnType<typeof setInterval> | undefined
+  let activeController: ReadableStreamDefaultController<Uint8Array> | undefined
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
+      activeController = controller
       sseClients.add(controller)
       controller.enqueue(encoder.encode(': connected\n\n'))
       keepalive = setInterval(() => {
@@ -209,6 +243,7 @@ function handleEvents(): Response {
     },
     cancel() {
       if (keepalive) clearInterval(keepalive)
+      if (activeController) sseClients.delete(activeController)
     },
   })
 
@@ -224,11 +259,9 @@ function handleEvents(): Response {
 
 async function handlePermission(req: Request): Promise<Response> {
   try {
-    const body = (await req.json()) as {
-      request_id: string
-      behavior: 'allow' | 'deny'
-    }
-    if (!body.request_id || !body.behavior) {
+    const body = await readJson(req)
+    if (typeof body.request_id !== 'string' || !body.request_id || body.request_id.length > 256 ||
+        typeof body.behavior !== 'string') {
       return Response.json(
         { error: 'request_id and behavior required' },
         { status: 400 },
@@ -251,7 +284,7 @@ async function handlePermission(req: Request): Promise<Response> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     process.stderr.write(`matrix-relay: /permission error: ${msg}\n`)
-    return Response.json({ error: msg }, { status: 500 })
+    return Response.json({ error: msg }, { status: err instanceof BodyError ? err.status : 500 })
   }
 }
 
@@ -263,11 +296,12 @@ Bun.serve({
   idleTimeout: 0, // SSE connections must stay open indefinitely
   async fetch(req) {
     const url = new URL(req.url)
+    if (!authorized(req)) return Response.json({ error: 'unauthorized' }, { status: 401 })
 
     if (url.pathname === '/message' && req.method === 'POST') return handleMessage(req)
     if (url.pathname === '/events' && req.method === 'GET') return handleEvents()
     if (url.pathname === '/permission' && req.method === 'POST') return handlePermission(req)
-    if (url.pathname === '/health') return Response.json({ status: 'ok', port: RELAY_PORT })
+    if (url.pathname === '/health') return Response.json({ status: 'ok', port: RELAY_PORT, session_id: RELAY_SESSION_ID })
 
     return new Response('not found', { status: 404 })
   },

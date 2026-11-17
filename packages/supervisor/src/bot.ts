@@ -3,7 +3,9 @@ import {
   SimpleFsStorageProvider,
   LogService,
   LogLevel,
+  RustSdkCryptoStorageProvider,
 } from 'matrix-bot-sdk'
+import { StoreType } from '@matrix-org/matrix-sdk-crypto-nodejs'
 import type Database from 'better-sqlite3'
 import type { Logger } from 'pino'
 import type { Config } from './config.js'
@@ -32,6 +34,17 @@ import {
   safeSetTyping,
 } from './matrix-send.js'
 
+const ENCRYPTION_STATE = [{
+  type: 'm.room.encryption',
+  state_key: '',
+  content: { algorithm: 'm.megolm.v1.aes-sha2' },
+}]
+
+async function assertEncrypted(client: MatrixClient, roomId: string): Promise<void> {
+  try { await client.getRoomStateEvent(roomId, 'm.room.encryption', '') }
+  catch { throw new Error('Refusing plaintext Matrix room ' + roomId + '; create a new encrypted room') }
+}
+
 const SDK_LOG_LEVELS: Record<string, LogLevel> = {
   debug: LogLevel.DEBUG,
   info: LogLevel.INFO,
@@ -43,10 +56,12 @@ export function createBot(config: Config, logger: Logger): MatrixClient {
   LogService.setLevel(SDK_LOG_LEVELS[config.logLevel] ?? LogLevel.WARN)
 
   const storage = new SimpleFsStorageProvider('data/bot-sync.json')
+  const crypto = new RustSdkCryptoStorageProvider('data/bot-crypto', StoreType.Sqlite)
   const client = new MatrixClient(
     config.matrix.homeserverUrl,
     config.matrix.accessToken,
     storage,
+    crypto,
   )
 
   logger.info('Matrix client created')
@@ -102,6 +117,7 @@ export async function bootstrapSpaceAndRooms(
         preset: 'private_chat',
         room_alias_name: 'claude-control',
         invite: [config.matrix.ownerUserId],
+        initial_state: ENCRYPTION_STATE,
       })
     }
     setConfig(db, 'control_room_id', controlRoomId)
@@ -121,6 +137,8 @@ export async function bootstrapSpaceAndRooms(
       // Already linked or no permission — ignore
     }
   }
+
+  await assertEncrypted(client, controlRoomId)
 
   // Ensure owner is invited to both space and control room.
   // Check membership first (GET, not rate-limited) so we don't burn
@@ -273,7 +291,7 @@ async function sendPermissionVerdict(
   db: Database.Database,
   logger: Logger,
 ): Promise<void> {
-  await sendPermission(port, permReq.request_id, behavior)
+  await sendPermission(port, permReq.request_id, behavior, permReq.session_id)
   resolvePermissionRequest(db, permReq.request_id, behavior === 'allow' ? 'allowed' : 'denied')
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await client.sendText(roomId, `${label} — ${permReq.tool_name}`)
@@ -283,55 +301,27 @@ async function sendPermissionVerdict(
   )
 }
 
-// --- Permission verdict via single-word text ---
-
-const ALLOW_WORDS = new Set(['yes', 'ja', 'jap', 'jo', 'sure', 'yep', 'yup', 'ok', 'okay', 'mach', 'klar', 'passt', 'allow', 'y', 'si', 'oui'])
-const DENY_WORDS = new Set(['no', 'nein', 'ne', 'nope', 'nah', 'deny', 'stop', 'n', 'nicht', 'lass'])
-
-function stripPunctuation(s: string): string {
-  return s.replaceAll(/[^a-zA-ZäöüÄÖÜß]/g, '')
-}
+// --- Permission verdicts require an explicit request ID ---
 
 function tryTextPermissionVerdict(
-  body: string,
-  session: Session,
-  db: Database.Database,
-  client: MatrixClient,
-  roomId: string,
-  logger: Logger,
+  body: string, session: Session, db: Database.Database,
+  client: MatrixClient, roomId: string, logger: Logger,
 ): boolean {
-  if (body.includes(' ')) return false
-
-  const pendingAll = db.prepare(
-    'SELECT * FROM permission_requests WHERE session_id = ? AND status = ? ORDER BY created_at DESC',
-  ).all(session.id, 'pending') as import('./types.js').PermissionRequest[]
-  if (pendingAll.length === 0) return false
-
-  const word = stripPunctuation(body.toLowerCase().trim())
-  if (!ALLOW_WORDS.has(word) && !DENY_WORDS.has(word)) return false
-
-  const pending = pendingAll[0]
-  const behavior = ALLOW_WORDS.has(word) ? 'allow' as const : 'deny' as const
-  const sessionPort = session.port
-  if (!sessionPort || !pending) return false
-
-  // Warn if multiple permissions are pending
-  if (pendingAll.length > 1) {
-    void client.sendText(roomId,
-      `Note: ${pendingAll.length} permissions pending. Responding to the most recent: \`${pending.tool_name}\``,
-    )
+  const match = /^(approve|deny)\s+([a-zA-Z0-9_-]+)$/i.exec(body.trim())
+  if (!match) return false
+  const requestId = match[2]!
+  const permission = db.prepare(
+    'SELECT * FROM permission_requests WHERE request_id = ? AND session_id = ? AND status = ?'
+  ).get(requestId, session.id, 'pending') as import('./types.js').PermissionRequest | undefined
+  if (!permission || !session.port) {
+    void client.sendText(roomId, 'Permission request not found, already handled or session detached.')
+    return true
   }
-
-  void (async () => {
-    try {
-      await sendPermissionVerdict(pending, behavior, sessionPort, roomId, client, db, logger)
-    } catch (err) {
-      logger.error({ err, requestId: pending.request_id }, 'Failed to send permission verdict')
-    }
-  })()
+  const behavior: 'allow' | 'deny' = match[1]!.toLowerCase() === 'approve' ? 'allow' : 'deny'
+  void sendPermissionVerdict(permission, behavior, session.port, roomId, client, db, logger)
+    .catch(err => logger.error({ err, requestId }, 'Permission verdict failed'))
   return true
 }
-
 // --- Control room message handler ---
 
 function handleControlRoomMessage(
@@ -413,6 +403,7 @@ async function autoAttachSession(
   if (!roomId) return
 
   const wasLocal = session.status === 'local_active'
+  await assertEncrypted(client, roomId)
 
   // Allocate a fresh port — the old port (if any) may be stale or reused.
   const port = nextFreePort(db, config.ports.start, config.ports.end)
@@ -440,7 +431,7 @@ async function autoAttachSession(
     },
   })
 
-  const healthy = await waitForHealth(port, logger, 30000)
+  const healthy = await waitForHealth(port, logger, session.id, 30000)
   if (!healthy) {
     try {
       await killClaude(updated, logger)
@@ -459,6 +450,7 @@ async function autoAttachSession(
     (event) => handleSSEEvent(event, { ...updated, status: 'active' }, client, db, logger),
     (err) => logger.error({ err, session: session.name }, 'SSE connection error'),
     logger,
+    session.id,
   )
   startTaskMirror({ ...updated, status: 'active' }, client, db, config.matrix.botUserId, logger)
 
@@ -491,7 +483,7 @@ async function autoAttachSession(
   await new Promise(r => setTimeout(r, 2000))
 
   await safeSetTyping(client, roomId, true, logger)
-  await sendMessage(port, sender, body)
+  await sendMessage(port, sender, body, session.id)
 }
 
 // --- Session room message handler ---
@@ -568,7 +560,7 @@ function handleSessionRoomMessage(
   void (async () => {
     try {
       await safeSetTyping(client, roomId, true, logger)
-      await sendMessage(port, sender, body)
+      await sendMessage(port, sender, body, session.id)
     } catch (err) {
       logger.error({ err, session: session.name }, 'Failed to relay message')
       await safeSetTyping(client, roomId, false, logger)
@@ -647,7 +639,8 @@ export function setupEventHandlers(
     const behavior: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
     const session = getSessionByRoomId(db, roomId)
 
-    const sessionPort = session?.port
+    if (!session || session.id !== permReq.session_id) return
+    const sessionPort = session.port
     if (!sessionPort) return
 
     void (async () => {

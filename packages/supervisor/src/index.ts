@@ -93,6 +93,14 @@ const activeSessions = getActiveSessions(db)
 if (activeSessions.length > 0) {
   logger.info({ count: activeSessions.length }, 'Restoring active sessions')
   for (const session of activeSessions) {
+    // Old plaintext rooms cannot safely carry code or permission decisions.
+    if (!session.room_id) continue
+    try { await client.getRoomStateEvent(session.room_id, 'm.room.encryption', '') }
+    catch {
+      updateSession(db, session.id, { status: 'detached', port: null, pid: null })
+      logger.warn({ session: session.name }, 'Refusing to restore unencrypted room')
+      continue
+    }
     // Skip sessions whose JSONL has no real turns — claude --resume would die
     // seconds after spawn on an effectively-empty session. See #22.
     if (!hasUserActivity(session.id, session.working_directory)) {
@@ -127,7 +135,7 @@ if (activeSessions.length > 0) {
         },
       })
 
-      const healthy = await waitForHealth(port, logger, 30000)
+      const healthy = await waitForHealth(port, logger, session.id, 30000)
       if (healthy) {
         updateSession(db, session.id, { status: 'active' })
         const active = { ...restored, status: 'active' as const }
@@ -136,6 +144,7 @@ if (activeSessions.length > 0) {
           (event) => handleSSEEvent(event, active, client, db, logger),
           (err) => logger.error({ err, session: active.name }, 'SSE connection error'),
           logger,
+          session.id,
         )
         startTaskMirror(active, client, db, config.matrix.botUserId, logger)
         logger.info({ session: active.name, port }, 'Session restored')

@@ -46,7 +46,7 @@ cd claude-matrix-bridge
 cd packages/matrix-relay && bun install && cd ../..
 
 # Install supervisor dependencies
-cd packages/supervisor && npm install && cd ../..
+cd packages/supervisor && npm ci && cd ../..
 ```
 
 ### 2. Create a Matrix bot account
@@ -141,7 +141,7 @@ All commands are sent in the `#claude-control` room:
 When Claude needs permission to use a tool (e.g. write a file, run a command), a permission request appears in the session room. You can respond by:
 
 - **Reacting** with ✅ 👍 (allow) or ❌ 👎 (deny)
-- **Typing** a single word: `yes`, `ja`, `ok`, `mach`, `sure` (allow) or `no`, `nein`, `nope`, `deny` (deny)
+- **Typing** `approve <request-id>` or `deny <request-id>` to act on one specific pending request
 - Any multi-word message is sent to Claude as a normal chat message
 
 ### Detach / Attach
@@ -202,9 +202,14 @@ tmux attach -t claude-my-session     # Watch Claude work
 - Only messages from `MATRIX_OWNER_USER_ID` are processed
 - All rooms are private, invite-only
 - Relay ports bind to `127.0.0.1` only
-- No E2EE (rooms are unencrypted by design)
+- End-to-end encryption is required in the hardened fork; existing plaintext rooms are refused, and Matrix room names/topics remain readable to the homeserver
 - Permission relay allows remote tool approval without `--dangerously-skip-permissions`
 
 ## License
 
 MIT
+
+
+## Hardening status
+
+**Security review required before deployment.** See [SECURITY-HARDENING.md](SECURITY-HARDENING.md) for installation, known limitations, and required Matrix integration tests. This branch does not yet have a successful integration test against a real homeserver.

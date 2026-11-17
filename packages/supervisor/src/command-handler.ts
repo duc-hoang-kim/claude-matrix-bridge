@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import type { MatrixClient } from "matrix-bot-sdk";
@@ -28,6 +28,14 @@ import { handleSSEEvent } from "./bot.js";
 import { scanSessions } from "./session-scanner.js";
 
 const startTime = Date.now();
+const SAFE_SESSION_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+function isAllowedWorkDir(dir: string, config: Config): boolean {
+  try {
+    const root = realpathSync(process.env.CMB_ALLOWED_WORKDIR_ROOT ?? config.claude.defaultWorkDir);
+    const actual = realpathSync(dir);
+    return actual === root || actual.startsWith(root + sep);
+  } catch { return false }
+}
 
 // Temporary mapping from /discover results: number → DiscoveredSession
 let discoverCache: DiscoveredSession[] = [];
@@ -257,19 +265,22 @@ async function attachDiscovered(
   const existing = getSessionById(db, discovered.id);
   if (existing) return resumeSession(existing, client, db, config, logger);
 
+  if (!isAllowedWorkDir(discovered.cwd, config)) return "Directory outside allowed project root.";
   const port = nextFreePort(db, config.ports.start, config.ports.end);
   if (port == null) return "No free ports available.";
 
   try {
     const name = discoveredName(discovered, db);
+    if (!SAFE_SESSION_NAME.test(name)) return "Unsafe discovered session name";
     const domain = config.matrix.botUserId.split(":")[1];
     const spaceId = getConfig(db, "space_id");
 
     const roomId = await client.createRoom({
       name,
-      topic: `Claude session — ${discovered.cwd}`,
+      topic: 'Encrypted Claude session',
       preset: "private_chat",
       invite: [config.matrix.ownerUserId],
+      initial_state: [{ type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } }],
     });
 
     await addRoomToSpace(client, spaceId, roomId, domain, logger);
@@ -305,19 +316,15 @@ async function resumeSession(
   config: Config,
   logger: Logger,
 ): Promise<string> {
-  // Allocate port if needed (archived sessions have port = null)
-  let port = session.port;
-  let reservedHere = false;
-  if (!port) {
-    const allocated = nextFreePort(db, config.ports.start, config.ports.end);
-    if (!allocated) return "No free ports available.";
-    port = allocated;
-    reservedHere = true;
-  }
-
-  // Mark spawning — our own SessionStart hook will see this and skip.
+  if (!isAllowedWorkDir(session.working_directory, config)) return "Directory outside allowed project root.";
+  if (!session.room_id) return "Session has no Matrix room.";
+  try { await client.getRoomStateEvent(session.room_id, 'm.room.encryption', '') }
+  catch { return "Refusing to resume into an unencrypted Matrix room."; }
+  // Detached sessions may have stale ports; always allocate a new one.
+  const port = nextFreePort(db, config.ports.start, config.ports.end);
+  if (!port) return "No free ports available.";
   updateSession(db, session.id, { status: "spawning", port });
-  if (reservedHere) releasePort(port);
+  releasePort(port);
   const updated: Session = { ...session, status: "spawning", port };
 
   // Spawn with --resume
@@ -335,7 +342,7 @@ async function resumeSession(
     },
   });
 
-  const healthy = await waitForHealth(port, logger, 30000);
+  const healthy = await waitForHealth(port, logger, session.id, 30000);
   if (!healthy) {
     try {
       await killClaude(updated, logger);
@@ -353,6 +360,7 @@ async function resumeSession(
     (event) => handleSSEEvent(event, { ...updated, status: "active" }, client, db, logger),
     (err) => logger.error({ err, session: session.name }, "SSE connection error"),
     logger,
+    session.id,
   );
   startTaskMirror({ ...updated, status: "active" }, client, db, config.matrix.botUserId, logger);
 
@@ -525,6 +533,8 @@ function parseNewArgs(
   workDir = resolve(workDir);
   if (!existsSync(workDir)) return `Directory not found: \`${workDir}\``;
   if (!name) name = autoName(workDir, db);
+  if (!SAFE_SESSION_NAME.test(name)) return "Invalid session name. Use 1–64 letters, numbers, underscores or hyphens.";
+  if (!isAllowedWorkDir(workDir, config)) return "Directory outside allowed project root.";
   if (getSessionByName(db, name)) return `Session \`${name}\` already exists. Choose a different name.`;
 
   return { workDir, name, mode: mode ?? "default" };
@@ -575,9 +585,10 @@ async function handleNew(
     logger.info({ name, workDir, port }, "Creating session");
     const roomId = await client.createRoom({
       name,
-      topic: `Claude session — ${workDir}`,
+      topic: 'Encrypted Claude session',
       preset: "private_chat",
       invite: [config.matrix.ownerUserId],
+      initial_state: [{ type: 'm.room.encryption', state_key: '', content: { algorithm: 'm.megolm.v1.aes-sha2' } }],
     });
 
     await addRoomToSpace(client, spaceId, roomId, domain, logger);
@@ -608,7 +619,7 @@ async function handleNew(
       },
     });
 
-    const healthy = await waitForHealth(port, logger, 30000);
+    const healthy = await waitForHealth(port, logger, session.id, 30000);
     if (!healthy) {
       try {
         await killClaude(session, logger);
@@ -627,6 +638,7 @@ async function handleNew(
       (event) => handleSSEEvent(event, active, client, db, logger),
       (err) => logger.error({ err, session: name }, "SSE connection error"),
       logger,
+      session.id,
     );
     startTaskMirror(active, client, db, config.matrix.botUserId, logger);
 

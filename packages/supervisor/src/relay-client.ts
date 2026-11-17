@@ -1,5 +1,6 @@
 import type { Logger } from 'pino'
 import type { SSEEvent } from './types.js'
+import { relayToken } from './security.js'
 
 const BASE_TIMEOUT = 30000
 
@@ -11,11 +12,12 @@ export async function sendMessage(
   port: number,
   sender: string,
   content: string,
+  sessionId: string,
   messageId?: string,
 ): Promise<{ ok: boolean; message_id: string }> {
   const res = await fetch(relayUrl(port, '/message'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${relayToken(sessionId)}` },
     body: JSON.stringify({ sender, content, message_id: messageId }),
     signal: AbortSignal.timeout(BASE_TIMEOUT),
   })
@@ -30,10 +32,11 @@ export async function sendPermission(
   port: number,
   requestId: string,
   behavior: 'allow' | 'deny',
+  sessionId: string,
 ): Promise<void> {
   const res = await fetch(relayUrl(port, '/permission'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${relayToken(sessionId)}` },
     body: JSON.stringify({ request_id: requestId, behavior }),
     signal: AbortSignal.timeout(BASE_TIMEOUT),
   })
@@ -43,12 +46,15 @@ export async function sendPermission(
   }
 }
 
-export async function checkHealth(port: number): Promise<boolean> {
+export async function checkHealth(port: number, sessionId: string): Promise<boolean> {
   try {
     const res = await fetch(relayUrl(port, '/health'), {
+      headers: { Authorization: `Bearer ${relayToken(sessionId)}` },
       signal: AbortSignal.timeout(2000),
     })
-    return res.ok
+    if (!res.ok) return false
+    const body = await res.json() as { session_id?: string }
+    return body.session_id === sessionId
   } catch {
     return false
   }
@@ -57,12 +63,13 @@ export async function checkHealth(port: number): Promise<boolean> {
 export async function waitForHealth(
   port: number,
   logger: Logger,
+  sessionId: string,
   maxWaitMs = 15000,
   intervalMs = 500,
 ): Promise<boolean> {
   const deadline = Date.now() + maxWaitMs
   while (Date.now() < deadline) {
-    if (await checkHealth(port)) {
+    if (await checkHealth(port, sessionId)) {
       logger.debug({ port }, 'Relay health check passed')
       return true
     }
@@ -115,12 +122,14 @@ export function connectSSE(
   onEvent: (event: SSEEvent) => void,
   onError: (err: Error) => void,
   logger: Logger,
+  sessionId: string,
 ): AbortController {
   const controller = new AbortController()
 
   void (async () => {
     try {
       const res = await fetch(relayUrl(port, '/events'), {
+        headers: { Authorization: `Bearer ${relayToken(sessionId)}` },
         signal: controller.signal,
       })
       if (!res.ok || !res.body) {

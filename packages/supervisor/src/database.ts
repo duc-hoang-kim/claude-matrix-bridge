@@ -114,7 +114,7 @@ export function nextFreePort(
 ): number | null {
   const usedPorts = new Set(
     getAllSessions(db)
-      .filter((s): s is Session & { port: number } => s.status === 'active' && s.port != null)
+      .filter((s): s is Session & { port: number } => (s.status === 'active' || s.status === 'spawning') && s.port != null)
       .map((s) => s.port),
   )
   for (let port = portStart; port <= portEnd; port++) {
