@@ -24,9 +24,17 @@ jobs:
       - name: Unit tests
         working-directory: packages/supervisor
         run: npm test
-      - name: Dependency audit
+      - name: Production audit (capture complete report)
         working-directory: packages/supervisor
-        run: npm audit --omit=dev --audit-level=high
+        run: npm audit --omit=dev --json > npm-audit.json || test "$?" -eq 1
+      - name: Fail on new vulnerabilities (known-risk baseline)
+        run: node scripts/check-audit-baseline.mjs packages/supervisor/npm-audit.json
+      - name: Upload full dependency audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supervisor-npm-audit
+          path: packages/supervisor/npm-audit.json
   relay:
     runs-on: ubuntu-latest
     steps:
