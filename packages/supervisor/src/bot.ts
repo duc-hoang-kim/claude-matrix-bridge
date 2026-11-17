@@ -301,55 +301,27 @@ async function sendPermissionVerdict(
   )
 }
 
-// --- Permission verdict via single-word text ---
-
-const ALLOW_WORDS = new Set(['yes', 'ja', 'jap', 'jo', 'sure', 'yep', 'yup', 'ok', 'okay', 'mach', 'klar', 'passt', 'allow', 'y', 'si', 'oui'])
-const DENY_WORDS = new Set(['no', 'nein', 'ne', 'nope', 'nah', 'deny', 'stop', 'n', 'nicht', 'lass'])
-
-function stripPunctuation(s: string): string {
-  return s.replaceAll(/[^a-zA-ZäöüÄÖÜß]/g, '')
-}
+// --- Permission verdicts require an explicit request ID ---
 
 function tryTextPermissionVerdict(
-  body: string,
-  session: Session,
-  db: Database.Database,
-  client: MatrixClient,
-  roomId: string,
-  logger: Logger,
+  body: string, session: Session, db: Database.Database,
+  client: MatrixClient, roomId: string, logger: Logger,
 ): boolean {
-  if (body.includes(' ')) return false
-
-  const pendingAll = db.prepare(
-    'SELECT * FROM permission_requests WHERE session_id = ? AND status = ? ORDER BY created_at DESC',
-  ).all(session.id, 'pending') as import('./types.js').PermissionRequest[]
-  if (pendingAll.length === 0) return false
-
-  const word = stripPunctuation(body.toLowerCase().trim())
-  if (!ALLOW_WORDS.has(word) && !DENY_WORDS.has(word)) return false
-
-  const pending = pendingAll[0]
-  const behavior = ALLOW_WORDS.has(word) ? 'allow' as const : 'deny' as const
-  const sessionPort = session.port
-  if (!sessionPort || !pending) return false
-
-  // Warn if multiple permissions are pending
-  if (pendingAll.length > 1) {
-    void client.sendText(roomId,
-      `Note: ${pendingAll.length} permissions pending. Responding to the most recent: \`${pending.tool_name}\``,
-    )
+  const match = /^(approve|deny)\s+([a-zA-Z0-9_-]+)$/i.exec(body.trim())
+  if (!match) return false
+  const requestId = match[2]!
+  const permission = db.prepare(
+    'SELECT * FROM permission_requests WHERE request_id = ? AND session_id = ? AND status = ?'
+  ).get(requestId, session.id, 'pending') as import('./types.js').PermissionRequest | undefined
+  if (!permission || !session.port) {
+    void client.sendText(roomId, 'Permission request not found, already handled or session detached.')
+    return true
   }
-
-  void (async () => {
-    try {
-      await sendPermissionVerdict(pending, behavior, sessionPort, roomId, client, db, logger)
-    } catch (err) {
-      logger.error({ err, requestId: pending.request_id }, 'Failed to send permission verdict')
-    }
-  })()
+  const behavior: 'allow' | 'deny' = match[1]!.toLowerCase() === 'approve' ? 'allow' : 'deny'
+  void sendPermissionVerdict(permission, behavior, session.port, roomId, client, db, logger)
+    .catch(err => logger.error({ err, requestId }, 'Permission verdict failed'))
   return true
 }
-
 // --- Control room message handler ---
 
 function handleControlRoomMessage(
