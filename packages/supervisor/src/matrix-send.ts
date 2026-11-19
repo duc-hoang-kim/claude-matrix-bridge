@@ -1,6 +1,8 @@
 import type { MatrixClient } from 'matrix-bot-sdk'
 import type { Logger } from 'pino'
+import type Database from 'better-sqlite3'
 import { withRetrySoft } from './retry.js'
+import { getSessionById } from './database.js'
 
 // Best-effort Matrix send wrappers. Each retries on network / 5xx,
 // logs loudly on final failure, and returns null instead of throwing.
@@ -52,4 +54,28 @@ export async function safeSetTyping(
   } catch (err) {
     logger.debug({ err, roomId, active }, 'setTyping failed (ignored)')
   }
+}
+
+/** Session status notice, posted inside the session's thread so the room's main
+ *  timeline (and thread list) stays clean. Unbound session (no thread yet): dropped. */
+export async function notify(
+  db: Database.Database,
+  client: MatrixClient,
+  sessionId: string,
+  text: string,
+  logger: Logger,
+  label = 'notify',
+): Promise<void> {
+  const s = getSessionById(db, sessionId)
+  if (!s?.room_id || !s.thread_root) return
+  await safeSendMessage(client, s.room_id, {
+    msgtype: 'm.text',
+    body: text,
+    'm.relates_to': {
+      rel_type: 'm.thread',
+      event_id: s.thread_root,
+      is_falling_back: true,
+      'm.in_reply_to': { event_id: s.thread_root },
+    },
+  }, logger, label)
 }

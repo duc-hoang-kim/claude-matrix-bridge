@@ -1,4 +1,7 @@
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { relayToken } from './security.js'
 import type { Logger } from 'pino'
 import type Database from 'better-sqlite3'
@@ -10,6 +13,20 @@ import { updateSession, expireSessionPermissions } from './database.js'
  * user's normal tmux (visible only via `tmux -L claude-matrix-bridge ls`).
  */
 const TMUX_SOCKET = 'claude-matrix-bridge'
+
+/**
+ * MCP config for matrix-relay, passed to each spawned session with
+ * --strict-mcp-config, so sessions load only the relay. Written by
+ * scripts/register-relay.sh; nothing is registered at user scope.
+ */
+// Opt-in: CMB_SLACK_CONNECTOR=1 reuses the logged-in claude.ai Slack connector (read-only tools
+// allowlisted). Needs --strict-mcp-config off, so ALL claude.ai connectors load; only these tools
+// are pre-approved. ponytail: no per-connector filter in claude, so other connectors prompt/deny by mode.
+// Read at spawn time: .env is loaded by loadConfig(), after this module is imported.
+const slackConnector = (): boolean => process.env.CMB_SLACK_CONNECTOR === '1'
+const SLACK_READ_TOOLS = ['search_public', 'search_public_and_private', 'search_users', 'search_channels',
+  'read_channel', 'read_thread', 'read_user_profile', 'read_canvas'].map(t => `mcp__claude_ai_Slack__slack_${t}`)
+const RELAY_MCP_CONFIG = join(homedir(), '.config', 'claude-matrix-bridge', 'relay-mcp.json')
 
 /**
  * Prepend socket and "no config" flags so our tmux server never loads
@@ -54,20 +71,19 @@ export function killTmuxServer(logger: Logger): void {
  */
 export function checkRelayRegistered(logger: Logger): void {
   try {
-    const output = execFileSync('claude', ['mcp', 'list'], {
-      encoding: 'utf-8',
-      timeout: 10000,
-    })
-    if (output.includes('matrix-relay')) {
-      logger.debug('matrix-relay MCP server registered')
+    const config = JSON.parse(readFileSync(RELAY_MCP_CONFIG, 'utf-8')) as {
+      mcpServers?: Record<string, unknown>
+    }
+    if (config.mcpServers && 'matrix-relay' in config.mcpServers) {
+      logger.debug({ config: RELAY_MCP_CONFIG }, 'matrix-relay MCP config found')
       return
     }
   } catch {
-    // mcp list failed — treat as not registered
+    // missing or unreadable config — treat as not registered
   }
 
   throw new Error(
-    'matrix-relay MCP server is not registered. Run "mise run register-relay" or "mise run setup" first.',
+    `matrix-relay MCP config missing at ${RELAY_MCP_CONFIG}. Run "mise run register-relay" or "mise run setup" first.`,
   )
 }
 
@@ -89,7 +105,14 @@ export function spawnClaude(
     '--dangerously-load-development-channels', 'server:matrix-relay',
     '--model', session.model,
     // Auto-allow relay tools so Claude doesn't prompt in tmux
-    '--allowedTools', 'mcp__matrix-relay__reply mcp__matrix-relay__react',
+    '--allowedTools', [
+      'mcp__matrix-relay__reply', 'mcp__matrix-relay__react',
+      ...(slackConnector() ? SLACK_READ_TOOLS : []),
+    ].join(' '),
+    // Load only the relay, not the user's global MCP servers
+    '--mcp-config', RELAY_MCP_CONFIG,
+    // Slack connector is a claude.ai account server; strict mode would hide it.
+    ...(slackConnector() ? [] : ['--strict-mcp-config']),
   ]
 
   if (options?.resume) {
@@ -222,6 +245,7 @@ export function spawnClaude(
   }
 
   // Monitor tmux session — poll for exit
+  let misses = 0
   const pollInterval = setInterval(() => {
     try {
       execFileSync('tmux', tmuxArgs('has-session', '-t', tmuxName), {
@@ -229,7 +253,9 @@ export function spawnClaude(
         timeout: 5000,
         stdio: ['pipe', 'pipe', 'pipe'],
       })
+      misses = 0
     } catch {
+      if (++misses < 2) return // one transient has-session failure isn't an exit
       clearInterval(pollInterval)
       activeSessions.delete(session.id)
       updateSession(db, session.id, { pid: null })
@@ -299,6 +325,48 @@ function sendShiftTab(tmuxName: string, logger: Logger): boolean {
     logger.warn({ err, tmuxName }, 'send-keys BTab failed')
     return false
   }
+}
+
+/** Type one Matrix message into the session's TUI, then press Enter. Used
+ *  instead of the relay channel when CMB_INPUT_MODE=tmux. Newlines become
+ *  spaces so the first Enter can't submit a partial message.
+ *  ponytail: single-line only; add bracketed paste (paste-buffer -p) for multi-line. */
+export async function sendTmuxInput(session: Session, text: string): Promise<void> {
+  const tmuxName = tmuxSessionName(session)
+  const line = text.replace(/\r?\n/g, ' ').trim()
+  if (!line) return
+  execFileSync('tmux', tmuxArgs('send-keys', '-t', tmuxName, '-l', '--', line), {
+    encoding: 'utf-8',
+    timeout: 3000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  // Enter sent instantly after the text gets swallowed while the TUI is redrawing.
+  // ponytail: fixed delay, no submit verification; poll the pane if it still drops.
+  await new Promise(r => setTimeout(r, 200))
+  execFileSync('tmux', tmuxArgs('send-keys', '-t', tmuxName, 'Enter'), {
+    encoding: 'utf-8',
+    timeout: 3000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+}
+
+/** Text of Claude's pending approval dialog (the "Do you want to proceed?" menu), or null.
+ *  ponytail: matches the TUI's menu by its "Esc to cancel" footer + numbered "❯ 1."; may drift across claude versions. */
+export function readPermissionPrompt(session: Session): string | null {
+  const pane = capturePaneText(tmuxSessionName(session))
+  if (!pane) return null
+  const lines = pane.split('\n')
+  let end = lines.length - 1
+  while (end >= 0 && !lines[end]!.includes('Esc to cancel')) end--
+  if (end < 0 || !lines.slice(Math.max(0, end - 8), end).some(l => /❯\s*1\./.test(l))) return null
+  return lines.slice(Math.max(0, end - 22), end + 1).join('\n').trim()
+}
+
+/** Answer that dialog: Enter takes the default "Yes", Escape cancels. */
+export function answerPermissionPrompt(session: Session, allow: boolean): void {
+  execFileSync('tmux', tmuxArgs('send-keys', '-t', tmuxSessionName(session), allow ? 'Enter' : 'Escape'), {
+    encoding: 'utf-8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'],
+  })
 }
 
 /** Cycle the TUI's permission mode (via Shift+Tab) until capture-pane shows

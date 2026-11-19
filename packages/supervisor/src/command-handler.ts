@@ -21,7 +21,7 @@ import {
   releasePort,
 } from "./database.js";
 import { spawnClaude, killClaude, readLivePermissionMode, cycleToPermissionMode } from "./process-manager.js";
-import { safeSendHtml } from "./matrix-send.js";
+import { safeSendHtml, notify } from "./matrix-send.js";
 import { startTaskMirror } from "./task-watcher.js";
 import { waitForHealth, connectSSE } from "./relay-client.js";
 import { handleSSEEvent } from "./bot.js";
@@ -29,7 +29,7 @@ import { scanSessions } from "./session-scanner.js";
 
 const startTime = Date.now();
 const SAFE_SESSION_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-function isAllowedWorkDir(dir: string, config: Config): boolean {
+export function isAllowedWorkDir(dir: string, config: Config): boolean {
   try {
     const root = realpathSync(process.env.CMB_ALLOWED_WORKDIR_ROOT ?? config.claude.defaultWorkDir);
     const actual = realpathSync(dir);
@@ -190,7 +190,7 @@ async function handleKill(
   expireSessionPermissions(db, session.id);
 
   // Rename the Matrix room to match so the user can tell which room is archived
-  if (session.room_id) {
+  if (session.room_id && !session.thread_root) {
     void client.sendStateEvent(session.room_id, "m.room.name", "", { name: archivedName }).catch(() => {});
   }
 
@@ -300,6 +300,7 @@ async function attachDiscovered(
       last_message_at: null,
       local_pid: null,
       last_matrix_activity: null,
+      thread_root: null,
     };
     createSession(db, session);
 
@@ -331,14 +332,7 @@ async function resumeSession(
   spawnClaude(updated, config, db, logger, {
     resume: true,
     onExit: () => {
-      if (session.room_id) {
-        void client
-          .sendHtmlText(
-            session.room_id,
-            "<strong>Claude session ended.</strong>",
-          )
-          .catch(() => {});
-      }
+      void notify(db, client, session.id, "Claude session ended.", logger);
     },
   });
 
@@ -364,12 +358,7 @@ async function resumeSession(
   );
   startTaskMirror({ ...updated, status: "active" }, client, db, config.matrix.botUserId, logger);
 
-  if (session.room_id) {
-    await client.sendHtmlText(
-      session.room_id,
-      "<strong>Session re-attached.</strong> Resumed with previous context.",
-    );
-  }
+  await notify(db, client, session.id, "Session re-attached. Resumed with previous context.", logger);
 
   return `Session **${session.name}** re-attached → [${session.name}](https://matrix.to/#/${session.room_id})`;
 }
@@ -516,12 +505,13 @@ function parseNewArgs(
     const dir = positional[0];
     const n = positional[1];
     if (!dir || !n) return "Usage: `/new <working-dir> [name]`";
-    workDir = expandTilde(dir);
+    // Relative paths resolve against the base dir, not the supervisor's cwd.
+    workDir = resolve(config.claude.defaultWorkDir, expandTilde(dir));
     name = n;
   } else {
     const arg = positional[0];
     if (!arg) return "Usage: `/new <working-dir> [name]` or `/new <name>`";
-    const expanded = expandTilde(arg);
+    const expanded = resolve(config.claude.defaultWorkDir, expandTilde(arg));
     if (existsSync(expanded)) {
       workDir = expanded;
     } else {
@@ -537,7 +527,7 @@ function parseNewArgs(
   if (!isAllowedWorkDir(workDir, config)) return "Directory outside allowed project root.";
   if (getSessionByName(db, name)) return `Session \`${name}\` already exists. Choose a different name.`;
 
-  return { workDir, name, mode: mode ?? "default" };
+  return { workDir, name, mode: mode ?? config.claude.defaultMode };
 }
 
 async function addRoomToSpace(
@@ -608,6 +598,7 @@ async function handleNew(
       last_message_at: null,
       local_pid: null,
       last_matrix_activity: null,
+      thread_root: null,
     };
     createSession(db, session);
 

@@ -1,5 +1,6 @@
 import pino from 'pino'
 import { loadConfig } from './config.js'
+import { notify } from './matrix-send.js'
 import {
   openDatabase,
   runMigrations,
@@ -9,7 +10,7 @@ import {
   nextFreePort,
   releasePort,
 } from './database.js'
-import { createBot, bootstrapSpaceAndRooms, setupEventHandlers, handleSSEEvent } from './bot.js'
+import { createBot, ensureCrossSigning, bootstrapSpaceAndRooms, setupEventHandlers, handleSSEEvent, startTmuxOutputPoller } from './bot.js'
 import { checkRelayRegistered, spawnClaude, killClaude, killAllProcesses, killTmuxServer } from './process-manager.js'
 import { waitForHealth, connectSSE } from './relay-client.js'
 import { startApiServer } from './api.js'
@@ -83,9 +84,11 @@ checkRelayRegistered(logger)
 const client = createBot(config, logger)
 await client.start()
 logger.info('Matrix client connected')
+await ensureCrossSigning(client, logger)
 
 const { controlRoomId } = await bootstrapSpaceAndRooms(client, db, config, logger)
 setupEventHandlers(client, db, config, controlRoomId, logger)
+startTmuxOutputPoller(client, db, config, logger)
 
 // --- Restart handling: restore active sessions from previous run ---
 
@@ -127,10 +130,7 @@ if (activeSessions.length > 0) {
         resume: true,
         onExit: () => {
           if (session.room_id) {
-            void client.sendHtmlText(
-              session.room_id,
-              '<strong>Claude session ended.</strong>',
-            ).catch(() => {})
+            void notify(db, client, session.id, 'Claude session ended.', logger)
           }
         },
       })
@@ -149,7 +149,7 @@ if (activeSessions.length > 0) {
         startTaskMirror(active, client, db, config.matrix.botUserId, logger)
         logger.info({ session: active.name, port }, 'Session restored')
         if (session.room_id) {
-          await client.sendText(session.room_id, 'Session restored after supervisor restart.')
+          await notify(db, client, session.id, 'Session restored after supervisor restart.', logger)
         }
       } else {
         logger.warn({ session: session.name, port }, 'Failed to restore session')

@@ -41,6 +41,8 @@ export function runMigrations(db: Database.Database): void {
     'INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)',
   )
 
+  // Table rebuilds need FK enforcement off (a no-op inside a transaction, so set it here).
+  db.pragma('foreign_keys = OFF')
   for (const file of files) {
     if (applied.has(file)) continue
     const sql = readFileSync(join(migrationsDir, file), 'utf-8')
@@ -49,6 +51,7 @@ export function runMigrations(db: Database.Database): void {
       insertApplied.run(file, new Date().toISOString())
     })()
   }
+  db.pragma('foreign_keys = ON')
 }
 
 // --- Config helpers ---
@@ -70,7 +73,24 @@ export function getSessionByRoomId(
   db: Database.Database,
   roomId: string,
 ): Session | undefined {
-  return db.prepare('SELECT * FROM sessions WHERE room_id = ?').get(roomId) as
+  return db.prepare('SELECT * FROM sessions WHERE room_id = ? ORDER BY created_at LIMIT 1').get(roomId) as
+    | Session
+    | undefined
+}
+
+export function getSessionByThread(
+  db: Database.Database,
+  roomId: string,
+  threadRoot: string,
+): Session | undefined {
+  return db.prepare('SELECT * FROM sessions WHERE room_id = ? AND thread_root = ?').get(roomId, threadRoot) as
+    | Session
+    | undefined
+}
+
+/** The room's unbound session (thread_root NULL), if any. */
+export function getUnboundRoomSession(db: Database.Database, roomId: string): Session | undefined {
+  return db.prepare("SELECT * FROM sessions WHERE room_id = ? AND thread_root IS NULL AND status != 'archived' ORDER BY created_at LIMIT 1").get(roomId) as
     | Session
     | undefined
 }
@@ -135,11 +155,11 @@ export function createSession(db: Database.Database, session: Session): void {
     `INSERT INTO sessions (
        id, room_id, name, working_directory, model, permission_mode,
        port, pid, status, created_at, updated_at, last_message_at,
-       local_pid, last_matrix_activity
+       local_pid, last_matrix_activity, thread_root
      ) VALUES (
        @id, @room_id, @name, @working_directory, @model, @permission_mode,
        @port, @pid, @status, @created_at, @updated_at, @last_message_at,
-       @local_pid, @last_matrix_activity
+       @local_pid, @last_matrix_activity, @thread_root
      )`,
   ).run(session)
 }

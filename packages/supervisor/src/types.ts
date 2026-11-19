@@ -45,6 +45,8 @@ export interface Session {
   local_pid: number | null
   /** ISO timestamp of the last message Matrix has posted or received. */
   last_matrix_activity: string | null
+  /** Matrix thread root event this session is bound to; null = unbound. */
+  thread_root: string | null
 }
 
 // --- Permission ---

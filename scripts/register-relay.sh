@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Register the matrix-relay MCP server with Claude Code (user scope).
+# Write the matrix-relay MCP config used by bridged Claude sessions.
 #
-# Resolves the relay path relative to this script's location, so it
-# works from any checkout (main, worktree, different machine).
-# Safe to run repeatedly — re-registers if the path changed.
+# Sessions are launched with `--mcp-config <this file> --strict-mcp-config`,
+# so only the relay loads in bridged sessions. Nothing is registered at user
+# or project scope, so ordinary Claude Code sessions are unaffected.
+#
+# Safe to run repeatedly. Removes an earlier user-scope registration.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RELAY_PATH="$REPO_DIR/packages/matrix-relay"
+CONFIG_DIR="$HOME/.config/claude-matrix-bridge"
+CONFIG_FILE="$CONFIG_DIR/relay-mcp.json"
 
 if [ ! -d "$RELAY_PATH" ]; then
   echo "[ERROR] matrix-relay not found at $RELAY_PATH" >&2
@@ -21,20 +25,22 @@ BUN_PATH=$(mise which bun 2>/dev/null || which bun 2>/dev/null) || {
   exit 1
 }
 
-CONFIG="{\"command\":\"$BUN_PATH\",\"args\":[\"run\",\"--cwd\",\"$RELAY_PATH\",\"--shell=bun\",\"--silent\",\"start\"]}"
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+node -e '
+  const [bun, relay] = process.argv.slice(1)
+  const config = { mcpServers: { "matrix-relay": {
+    command: bun,
+    args: ["run", "--cwd", relay, "--shell=bun", "--silent", "start"],
+  } } }
+  process.stdout.write(JSON.stringify(config, null, 2) + "\n")
+' "$BUN_PATH" "$RELAY_PATH" > "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
 
-# Check if already registered with the correct path
-CURRENT=$(claude mcp list 2>/dev/null || true)
-if echo "$CURRENT" | grep -q "matrix-relay" && echo "$CURRENT" | grep -q "$RELAY_PATH"; then
-  echo "[INFO] matrix-relay already registered at $RELAY_PATH"
-  exit 0
+# An earlier user-scope registration would load the relay in every Claude session.
+if claude mcp list 2>/dev/null | grep -q "^matrix-relay"; then
+  claude mcp remove --scope user matrix-relay >/dev/null 2>&1 || true
+  echo "[INFO] Removed earlier user-scope matrix-relay registration"
 fi
 
-# Remove stale registration if present (path changed)
-if echo "$CURRENT" | grep -q "matrix-relay"; then
-  echo "[INFO] Updating matrix-relay registration"
-  claude mcp remove --scope user matrix-relay 2>/dev/null || true
-fi
-
-claude mcp add-json --scope user matrix-relay "$CONFIG"
-echo "[INFO] matrix-relay registered at $RELAY_PATH"
+echo "[INFO] matrix-relay MCP config written to $CONFIG_FILE"

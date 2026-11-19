@@ -5,7 +5,8 @@ import {
   LogLevel,
   RustSdkCryptoStorageProvider,
 } from 'matrix-bot-sdk'
-import { StoreType } from '@matrix-org/matrix-sdk-crypto-nodejs'
+import { StoreType, type OlmMachine } from '@matrix-org/matrix-sdk-crypto-nodejs'
+import { randomUUID } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import type { Logger } from 'pino'
 import type { Config } from './config.js'
@@ -14,6 +15,11 @@ import {
   getConfig,
   setConfig,
   getSessionByRoomId,
+  getSessionById,
+  getSessionByThread,
+  getUnboundRoomSession,
+  createSession,
+  getAllSessions,
   updateSession,
   createPermissionRequest,
   getPermissionRequestByEventId,
@@ -22,13 +28,16 @@ import {
   releasePort,
 } from './database.js'
 import { sendPermission, sendMessage, waitForHealth, connectSSE } from './relay-client.js'
-import { spawnClaude, killClaude } from './process-manager.js'
-import { handleCommand, isModeCommand, handleModeCommand } from './command-handler.js'
+import { expireSessionPermissions } from './database.js'
+import { spawnClaude, killClaude, sendTmuxInput, readPermissionPrompt, answerPermissionPrompt } from './process-manager.js'
+import { handleCommand, isModeCommand, handleModeCommand, isAllowedWorkDir } from './command-handler.js'
 import { formatMarkdown, splitMessage } from './message-formatter.js'
-import { buildReplay } from './replay.js'
+import { buildReplay, hasUserActivity } from './replay.js'
 import { startTaskMirror } from './task-watcher.js'
+import { armTmuxOutput, pollTmuxOutput } from './tmux-output.js'
 import {
   safeSendText,
+  notify,
   safeSendHtml,
   safeSendMessage,
   safeSetTyping,
@@ -68,6 +77,38 @@ export function createBot(config: Config, logger: Logger): MatrixClient {
   return client
 }
 
+// Clients flag messages from a bot device unless the bot's own cross-signing identity
+// signs that device. Call after client.start(), when the crypto engine exists.
+// ponytail: reaches into matrix-bot-sdk's private engine; drop once the SDK exposes bootstrap.
+export async function ensureCrossSigning(client: MatrixClient, logger: Logger): Promise<void> {
+  try {
+    if (await deviceCrossSignedOnServer(client)) {
+      logger.info('Bot device is cross-signed on the homeserver')
+      return
+    }
+    // false = reuse the local identity if one exists; never reset it.
+    const machine = (client.crypto as unknown as { engine: { machine: OlmMachine } }).engine.machine
+    await machine.bootstrapCrossSigning(false)
+    logger.info('Ran bot cross-signing bootstrap')
+    if (!(await deviceCrossSignedOnServer(client))) {
+      logger.warn('Bot device is not cross-signed on the homeserver; bot messages stay unverified')
+    }
+  } catch (err) {
+    // Trust is best-effort (upload may need interactive auth); never block the bridge on it.
+    logger.warn({ err }, 'Cross-signing setup failed; bot messages stay unverified')
+  }
+}
+
+// The homeserver is the source of truth: local keys alone don't make other clients trust the device.
+async function deviceCrossSignedOnServer(client: MatrixClient): Promise<boolean> {
+  const userId = await client.getUserId()
+  const deviceId = client.crypto.clientDeviceId
+  const resp = await client.doRequest('POST', '/_matrix/client/v3/keys/query', null, { device_keys: { [userId]: [] } })
+  const selfSigningIds = Object.keys(resp.self_signing_keys?.[userId]?.keys ?? {})
+  const deviceSigIds = Object.keys(resp.device_keys?.[userId]?.[deviceId]?.signatures?.[userId] ?? {})
+  return Boolean(resp.master_keys?.[userId]) && selfSigningIds.some(id => deviceSigIds.includes(id))
+}
+
 export async function bootstrapSpaceAndRooms(
   client: MatrixClient,
   db: Database.Database,
@@ -87,14 +128,34 @@ export async function bootstrapSpaceAndRooms(
       logger.info({ spaceId }, 'Found existing space by alias')
     } catch {
       logger.info('Creating Claude Code space')
-      const space = await client.createSpace({
+      // Not client.createSpace(): matrix-bot-sdk 0.8.0 lists the creator in
+      // power_level_content_override.users, which room v12+ servers reject
+      // ("Creator user must not appear in content.users"). Same settings, no creator entry.
+      spaceId = await client.createRoom({
         name: 'Claude Code',
         topic: 'Claude Code remote sessions',
-        isPublic: false,
-        localpart: 'claude-code',
-        invites: [config.matrix.ownerUserId],
+        preset: 'private_chat',
+        room_alias_name: 'claude-code',
+        invite: [config.matrix.ownerUserId],
+        creation_content: { type: 'm.space' },
+        initial_state: [
+          {
+            type: 'm.room.history_visibility',
+            state_key: '',
+            content: { history_visibility: 'shared' },
+          },
+        ],
+        power_level_content_override: {
+          ban: 100,
+          events_default: 50,
+          invite: 50,
+          kick: 100,
+          notifications: { room: 100 },
+          redact: 100,
+          state_default: 100,
+          users_default: 0,
+        },
       })
-      spaceId = space.roomId
       logger.info({ spaceId }, 'Space created')
     }
     setConfig(db, 'space_id', spaceId)
@@ -204,6 +265,83 @@ function formatPermissionRequest(event: import('./types.js').PermissionRequestEv
   return [header, `**${tool}**`, '```json', JSON.stringify(input, null, 2), '```'].join('\n')
 }
 
+// --- Thread routing: one Claude session per Matrix thread ---
+
+function threadRelation(db: Database.Database, sessionId: string): Record<string, unknown> {
+  const root = getSessionById(db, sessionId)?.thread_root
+  if (!root) return {}
+  return {
+    'm.relates_to': {
+      rel_type: 'm.thread',
+      event_id: root,
+      is_falling_back: true,
+      'm.in_reply_to': { event_id: root },
+    },
+  }
+}
+
+/** First chat in a room with no session (e.g. the assistant alert channel): open one
+ *  in the default workdir, bound to this thread. Later top-level chats clone it.
+ *  ponytail: named by random id, not the room name; read m.room.name if that matters. */
+function openRoomSession(db: Database.Database, roomId: string, root: string, config: Config): Session | undefined {
+  // The Claude Code space is a container, not a chat room; it never gets a session.
+  if (roomId === getConfig(db, 'space_id')) return undefined
+  if (!isAllowedWorkDir(config.claude.defaultWorkDir, config)) return undefined
+  const now = new Date().toISOString()
+  const session: Session = {
+    id: randomUUID(),
+    room_id: roomId,
+    name: `room-${randomUUID().slice(0, 8)}`,
+    working_directory: config.claude.defaultWorkDir,
+    model: config.claude.model,
+    permission_mode: config.claude.defaultMode,
+    port: null,
+    pid: null,
+    status: 'detached', // auto-attach spawns it on first message
+    created_at: now,
+    updated_at: now,
+    last_message_at: null,
+    local_pid: null,
+    last_matrix_activity: null,
+    thread_root: root,
+  }
+  createSession(db, session)
+  return session
+}
+
+/** Session for (room, thread root): existing, else the room's unbound session
+ *  claims it, else a new session cloned from the room's first one (a room with
+ *  no session at all opens its first one). */
+export function resolveThreadSession(db: Database.Database, roomId: string, root: string, config: Config): Session | undefined {
+  const bound = getSessionByThread(db, roomId, root)
+  if (bound) return bound
+  const unbound = getUnboundRoomSession(db, roomId)
+  if (unbound) {
+    updateSession(db, unbound.id, { thread_root: root })
+    return { ...unbound, thread_root: root }
+  }
+  const parent = getSessionByRoomId(db, roomId)
+  if (!parent) return openRoomSession(db, roomId, root, config)
+  const now = new Date().toISOString()
+  const child: Session = {
+    ...parent,
+    id: randomUUID(),
+    permission_mode: config.claude.defaultMode,
+    name: `${parent.name.slice(0, 50)}-${randomUUID().slice(0, 6)}`,
+    port: null,
+    pid: null,
+    local_pid: null,
+    status: 'detached', // auto-attach spawns it on first message
+    created_at: now,
+    updated_at: now,
+    last_message_at: null,
+    last_matrix_activity: null,
+    thread_root: root,
+  }
+  createSession(db, child)
+  return child
+}
+
 // --- SSE Event Handler ---
 
 export function handleSSEEvent(
@@ -230,6 +368,7 @@ export function handleSSEEvent(
               body,
               format: 'org.matrix.custom.html',
               formatted_body,
+              ...threadRelation(db, session.id),
             })
           }
           const now = new Date().toISOString()
@@ -256,6 +395,7 @@ export function handleSSEEvent(
             body: plain,
             format: 'org.matrix.custom.html',
             formatted_body,
+            ...threadRelation(db, session.id),
           })
           createPermissionRequest(db, {
             request_id: event.request_id,
@@ -291,10 +431,15 @@ async function sendPermissionVerdict(
   db: Database.Database,
   logger: Logger,
 ): Promise<void> {
-  await sendPermission(port, permReq.request_id, behavior, permReq.session_id)
+  if (permReq.request_id.startsWith('tmux-')) {
+    const s = getSessionById(db, permReq.session_id)
+    if (s) answerPermissionPrompt(s, behavior === 'allow')
+  } else {
+    await sendPermission(port, permReq.request_id, behavior, permReq.session_id)
+  }
   resolvePermissionRequest(db, permReq.request_id, behavior === 'allow' ? 'allowed' : 'denied')
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-  await client.sendText(roomId, `${label} — ${permReq.tool_name}`)
+  await notify(db, client, permReq.session_id, `${label} — ${permReq.tool_name}`, logger, 'verdict-notice')
   logger.info(
     { requestId: permReq.request_id, behavior, tool: permReq.tool_name },
     'Permission verdict sent',
@@ -314,7 +459,7 @@ function tryTextPermissionVerdict(
     'SELECT * FROM permission_requests WHERE request_id = ? AND session_id = ? AND status = ?'
   ).get(requestId, session.id, 'pending') as import('./types.js').PermissionRequest | undefined
   if (!permission || !session.port) {
-    void client.sendText(roomId, 'Permission request not found, already handled or session detached.')
+    void notify(db, client, session.id, 'Permission request not found, already handled or session detached.', logger)
     return true
   }
   const behavior: 'allow' | 'deny' = match[1]!.toLowerCase() === 'approve' ? 'allow' : 'deny'
@@ -408,7 +553,7 @@ async function autoAttachSession(
   // Allocate a fresh port — the old port (if any) may be stale or reused.
   const port = nextFreePort(db, config.ports.start, config.ports.end)
   if (!port) {
-    await safeSendText(client, roomId, 'No free ports available. Cannot re-attach session.', logger, 'auto-attach:no-free-ports')
+    await notify(db, client, session.id, 'No free ports available. Cannot re-attach session.', logger, 'auto-attach:no-free-ports')
     return
   }
 
@@ -425,9 +570,9 @@ async function autoAttachSession(
   const updated: Session = { ...session, status: 'spawning', port, local_pid: null }
 
   spawnClaude(updated, config, db, logger, {
-    resume: true,
+    resume: hasUserActivity(session.id, session.working_directory),
     onExit: () => {
-      void safeSendHtml(client, roomId, '<strong>Claude session ended.</strong>', logger, 'session-ended-notice')
+      void notify(db, client, session.id, 'Claude session ended.', logger, 'session-ended-notice')
     },
   })
 
@@ -439,7 +584,7 @@ async function autoAttachSession(
       logger.warn({ err, session: session.name }, 'killClaude failed during failed-spawn cleanup')
     }
     updateSession(db, session.id, { status: 'detached', port: null, pid: null })
-    await safeSendText(client, roomId, 'Failed to start session. Send a message to retry.', logger, 'auto-attach:health-failed')
+    await notify(db, client, session.id, 'Failed to start session. Send a message to retry.', logger, 'auto-attach:health-failed')
     return
   }
 
@@ -472,9 +617,9 @@ async function autoAttachSession(
         'auto-attach:replay',
       )
     }
-    await safeSendText(client, roomId, 'Local session closed, Matrix control resumed.', logger, 'auto-attach:handoff-notice')
+    await notify(db, client, session.id, 'Local session closed, Matrix control resumed.', logger, 'auto-attach:handoff-notice')
   } else {
-    await safeSendText(client, roomId, 'Session re-attached.', logger, 'auto-attach:reattached-notice')
+    await notify(db, client, session.id, 'Session re-attached.', logger, 'auto-attach:reattached-notice')
   }
 
   // Brief wait for Claude to fully initialize the channel after startup.
@@ -482,7 +627,20 @@ async function autoAttachSession(
   // a moment longer to wire up the channel protocol after resume.
   await new Promise(r => setTimeout(r, 2000))
 
-  await safeSetTyping(client, roomId, true, logger)
+  if (config.inputMode !== 'tmux') await safeSetTyping(client, roomId, true, logger)
+  await deliverToClaude(session, port, sender, body, config)
+}
+
+// Matrix message -> Claude. Default: relay channel. CMB_INPUT_MODE=tmux: type
+// into the pane. No typing indicator in tmux mode, since no reply event clears it.
+async function deliverToClaude(
+  session: Session, port: number, sender: string, body: string, config: Config,
+): Promise<void> {
+  if (config.inputMode === 'tmux') {
+    armTmuxOutput(session) // before typing, so the reply lands after the cursor
+    await sendTmuxInput(session, body)
+    return
+  }
   await sendMessage(port, sender, body, session.id)
 }
 
@@ -514,18 +672,29 @@ function handleSessionRoomMessage(
     return
   }
 
+  // /exit or !exit: stop this thread's Claude. History stays; the next message re-attaches.
+  if (/^[!/]exit$/.test(body.trim())) {
+    void (async () => {
+      if (session.status === 'active') await killClaude(session, logger)
+      updateSession(db, session.id, { status: 'detached', pid: null })
+      expireSessionPermissions(db, session.id)
+      await safeSendMessage(client, roomId, { msgtype: 'm.text', body: 'Claude session stopped. Send a message to resume.', ...threadRelation(db, session.id) }, logger, 'exit-notice')
+    })()
+    return
+  }
+
   if (session.status === 'archived') {
-    void safeSendText(client, roomId, `Session archived. Use \`/attach ${session.name}\` in control room.`, logger, 'room:archived')
+    void notify(db, client, session.id, `Session archived. Use \`/attach ${session.name}\` in control room.`, logger, 'room:archived')
     return
   }
   if (session.status === 'spawning') {
-    void safeSendText(client, roomId, 'Session is starting up, please wait...', logger, 'room:spawning')
+    void notify(db, client, session.id, 'Session is starting up, please wait...', logger, 'room:spawning')
     return
   }
 
   if (session.status === 'local_active' || session.status === 'detached') {
     if (autoAttachInProgress.has(session.id)) {
-      void safeSendText(client, roomId, 'Re-attaching session, please wait...', logger, 'room:already-attaching')
+      void notify(db, client, session.id, 'Re-attaching session, please wait...', logger, 'room:already-attaching')
       return
     }
     autoAttachInProgress.add(session.id)
@@ -542,7 +711,7 @@ function handleSessionRoomMessage(
         await autoAttachSession(session, body, sender, client, db, config, logger)
       } catch (err) {
         logger.error({ err, session: session.name }, 'Auto-attach failed')
-        await safeSendText(client, roomId, `Auto-attach failed: ${err instanceof Error ? err.message : err}`, logger, 'auto-attach:failure-notice')
+        await notify(db, client, session.id, `Auto-attach failed: ${err instanceof Error ? err.message : err}`, logger, 'auto-attach:failure-notice')
       } finally {
         clearTimeout(watchdog)
         autoAttachInProgress.delete(session.id)
@@ -553,20 +722,99 @@ function handleSessionRoomMessage(
 
   const port = session.port
   if (!port) {
-    void safeSendText(client, roomId, `Session has no port assigned. Use \`/attach ${session.name}\` in control room.`, logger, 'room:no-port')
+    void notify(db, client, session.id, `Session has no port assigned. Use \`/attach ${session.name}\` in control room.`, logger, 'room:no-port')
     return
   }
 
   void (async () => {
     try {
-      await safeSetTyping(client, roomId, true, logger)
-      await sendMessage(port, sender, body, session.id)
+      if (config.inputMode !== 'tmux') await safeSetTyping(client, roomId, true, logger)
+      await deliverToClaude(session, port, sender, body, config)
     } catch (err) {
       logger.error({ err, session: session.name }, 'Failed to relay message')
       await safeSetTyping(client, roomId, false, logger)
-      await safeSendText(client, roomId, `Failed to send message to Claude: ${err instanceof Error ? err.message : err}`, logger, 'room:relay-failure')
+      await notify(db, client, session.id, `Failed to send message to Claude: ${err instanceof Error ? err.message : err}`, logger, 'room:relay-failure')
     }
   })()
+}
+
+// Tmux mode: relay permission events don't exist, so surface Claude's approval
+// dialog from the pane. One post per dialog; ✅/❌ reaction (or `approve <id>`) answers it.
+const pendingPrompt = new Map<string, { requestId: string; text: string }>()
+
+function expirePending(db: Database.Database, requestId: string): void {
+  db.prepare("UPDATE permission_requests SET status = 'expired', resolved_at = ? WHERE request_id = ? AND status = 'pending'")
+    .run(new Date().toISOString(), requestId)
+}
+
+async function postTmuxPrompt(
+  session: Session, roomId: string, client: MatrixClient, db: Database.Database,
+): Promise<void> {
+  const text = readPermissionPrompt(session)
+  const known = pendingPrompt.get(session.id)
+  if (!text) {
+    if (known) {
+      pendingPrompt.delete(session.id)
+      expirePending(db, known.requestId) // answered or cancelled in the terminal
+    }
+    return
+  }
+  // Key on the menu only: the lines above it include a live spinner that changes every poll.
+  const menu = (t: string): string => t.slice(Math.max(0, t.search(/Do you want|\n\s*❯\s*1\./)))
+  if (known && menu(known.text) === menu(text)) return
+  if (known) expirePending(db, known.requestId)
+  const requestId = `tmux-${randomUUID().slice(0, 8)}`
+  pendingPrompt.set(session.id, { requestId, text })
+  const { body, formatted_body } = formatMarkdown(`🔐 **Claude needs approval**\n\`\`\`\n${text}\n\`\`\`\nReact ✅ to allow, ❌ to deny (or reply \`approve ${requestId}\` / \`deny ${requestId}\`).`)
+  const eventId = await client.sendMessage(roomId, {
+    msgtype: 'm.text', body, format: 'org.matrix.custom.html', formatted_body,
+    ...threadRelation(db, session.id),
+  })
+  createPermissionRequest(db, {
+    request_id: requestId, session_id: session.id, event_id: eventId,
+    tool_name: 'terminal prompt', description: text.slice(0, 200), status: 'pending',
+    created_at: new Date().toISOString(), resolved_at: null,
+  })
+}
+
+// Tmux mode: post Claude's replies into each session's room. Polls the session
+// JSONL once a second; only Matrix-initiated turns (armed in deliverToClaude) are posted.
+export function startTmuxOutputPoller(
+  client: MatrixClient, db: Database.Database, config: Config, logger: Logger,
+): void {
+  if (config.inputMode !== 'tmux') return
+  let busy = false
+  setInterval(() => {
+    if (busy) return
+    busy = true
+    void (async () => {
+      try {
+        for (const session of getAllSessions(db)) {
+          const roomId = session.room_id
+          if (!roomId) continue
+          try {
+            if (session.status === 'active') await postTmuxPrompt(session, roomId, client, db)
+            for (const text of pollTmuxOutput(session)) {
+              for (const chunk of splitMessage(text)) {
+                const { body, formatted_body } = formatMarkdown(chunk)
+                await client.sendMessage(roomId, {
+                  msgtype: 'm.text',
+                  body,
+                  format: 'org.matrix.custom.html',
+                  formatted_body,
+                  ...threadRelation(db, session.id),
+                })
+              }
+            }
+          } catch (err) {
+            logger.error({ err, session: session.name }, 'Failed to post tmux output')
+          }
+        }
+      } finally {
+        busy = false
+      }
+    })()
+  }, 1000)
 }
 
 // --- Event Handlers ---
@@ -604,7 +852,10 @@ export function setupEventHandlers(
       return
     }
 
-    const session = getSessionByRoomId(db, roomId)
+    const rel = content['m.relates_to'] as Record<string, unknown> | undefined
+    const root = rel?.rel_type === 'm.thread' ? rel.event_id : event.event_id
+    if (typeof root !== 'string') return
+    const session = resolveThreadSession(db, roomId, root, config)
     if (!session) return
 
     handleSessionRoomMessage(body, sender, session, roomId, client, db, config, logger)
@@ -637,9 +888,9 @@ export function setupEventHandlers(
     if (!isAllow && !isDeny) return
 
     const behavior: 'allow' | 'deny' = isAllow ? 'allow' : 'deny'
-    const session = getSessionByRoomId(db, roomId)
+    const session = getSessionById(db, permReq.session_id)
 
-    if (!session || session.id !== permReq.session_id) return
+    if (!session || session.room_id !== roomId) return
     const sessionPort = session.port
     if (!sessionPort) return
 

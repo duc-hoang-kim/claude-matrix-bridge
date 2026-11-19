@@ -15,6 +15,8 @@ export interface JsonlRecord {
   timestamp?: string
   /** Present on `type:"permission-mode"` records (and on user turns). */
   permissionMode?: string
+  /** Set on subagent records; they aren't Claude's direct reply. */
+  isSidechain?: boolean
 }
 
 export interface ContentBlock {
@@ -49,13 +51,17 @@ export interface ReplayBlock {
 // --- JSONL helpers ---
 
 function encodeWorkDir(workDir: string): string {
-  return workDir.replaceAll('/', '-')
+  return workDir.replaceAll(/[^A-Za-z0-9]/g, '-') // matches Claude's own project-dir encoding
 }
 
 function jsonlPath(sessionId: string, workDir: string): string | null {
-  const encoded = encodeWorkDir(workDir)
-  const path = join(PROJECTS_DIR, encoded, `${sessionId}.jsonl`)
+  const path = jsonlPathFor(sessionId, workDir)
   return existsSync(path) ? path : null
+}
+
+/** Where Claude writes a session's transcript, whether or not it exists yet. */
+export function jsonlPathFor(sessionId: string, workDir: string): string {
+  return join(PROJECTS_DIR, encodeWorkDir(workDir), `${sessionId}.jsonl`)
 }
 
 export function parseJsonl(raw: string): JsonlRecord[] {

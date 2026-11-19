@@ -29,6 +29,11 @@ function mockClient() {
       sent.push({ roomId, text })
       return '$event_id'
     }),
+    // notices are posted inside the session's thread via sendMessage
+    sendMessage: mock.fn(async (roomId: string, content: { body: string }) => {
+      sent.push({ roomId, text: content.body })
+      return '$event_id'
+    }),
   } as unknown as import('matrix-bot-sdk').MatrixClient
 }
 
@@ -69,6 +74,7 @@ function insertSession(db: Database.Database, overrides: Partial<Session> = {}):
     last_message_at: null,
     local_pid: null,
     last_matrix_activity: null,
+    thread_root: null,
     ...overrides,
   }
   createSession(db, session)
@@ -170,7 +176,7 @@ describe('handleSessionStart', () => {
 
   // active -> local_active sends Matrix notification
   it('sends room notification on active -> local_active', async () => {
-    const session = insertSession(db, { status: 'active', room_id: '!myroom:test' })
+    const session = insertSession(db, { status: 'active', room_id: '!myroom:test', thread_root: '$t' })
     await handleSessionStart(
       { session_id: session.id, pid: 5555 },
       db, client, logger,
@@ -337,7 +343,7 @@ describe('handleSessionEnd', () => {
 
   // Sends room notification on release
   it('sends room notification on release', async () => {
-    const session = insertSession(db, { status: 'local_active', local_pid: 5555, room_id: '!room:test' })
+    const session = insertSession(db, { status: 'local_active', local_pid: 5555, room_id: '!room:test', thread_root: '$t' })
     await handleSessionEnd(
       { session_id: session.id, pid: 5555 },
       db, client, logger,

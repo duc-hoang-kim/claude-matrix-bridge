@@ -1,3 +1,4 @@
+import { USER_PERMISSION_MODES, type UserPermissionMode } from "./types.js";
 import dotenv from "dotenv";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,8 @@ export interface Config {
   claude: {
     model: string;
     defaultWorkDir: string;
+    /** Permission mode for new sessions (/new and new threads). CMB_DEFAULT_MODE, default auto. */
+    defaultMode: UserPermissionMode;
   };
   ports: {
     start: number;
@@ -26,6 +29,9 @@ export interface Config {
   };
   apiPort: number;
   logLevel: string;
+  // "channel": deliver via the matrix-relay channel (needs org channels enabled).
+  // "tmux": type the message into the Claude pane with tmux send-keys.
+  inputMode: "channel" | "tmux";
 }
 
 function requireEnv(key: string): string {
@@ -60,6 +66,9 @@ export function loadConfig(): Config {
     claude: {
       model: process.env.CLAUDE_MODEL ?? "sonnet",
       defaultWorkDir: process.env.CLAUDE_DEFAULT_WORKDIR ?? process.cwd(),
+      defaultMode: (USER_PERMISSION_MODES as readonly string[]).includes(process.env.CMB_DEFAULT_MODE ?? '')
+        ? (process.env.CMB_DEFAULT_MODE as UserPermissionMode)
+        : "auto",
     },
     ports: {
       start: Number(process.env.RELAY_PORT_START ?? 9000),
@@ -73,5 +82,6 @@ export function loadConfig(): Config {
     },
     apiPort: Number(process.env.SUPERVISOR_API_PORT ?? 9090),
     logLevel: process.env.LOG_LEVEL ?? "info",
+    inputMode: process.env.CMB_INPUT_MODE === "tmux" ? "tmux" : "channel",
   };
 }

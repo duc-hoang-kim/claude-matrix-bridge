@@ -4,6 +4,7 @@ import type { MatrixClient } from 'matrix-bot-sdk'
 import type { Logger } from 'pino'
 import type { Config } from './config.js'
 import { getSessionById, updateSession } from './database.js'
+import { notify } from './matrix-send.js'
 import { killClaude } from './process-manager.js'
 import { handoffToken, bearerValid } from './security.js'
 
@@ -158,7 +159,7 @@ export async function handleSessionStart(
     const msg = localPid
       ? `Session handed off to local terminal (PID ${localPid}). Send a new message here to reclaim control.`
       : 'Session handed off to local terminal. Send a new message here to reclaim control.'
-    void client.sendText(session.room_id, msg).catch(() => {})
+    void notify(db, client, session.id, msg, logger)
   }
 
   return { status: 200, body: { status: 'local_active', action: 'detached' } }
@@ -201,12 +202,7 @@ export async function handleSessionEnd(
   updateSession(db, session.id, { status: 'detached', local_pid: null })
 
   if (session.room_id) {
-    void client
-      .sendText(
-        session.room_id,
-        'Local session ended. Send a message to reclaim this session in Matrix.',
-      )
-      .catch(() => {})
+    void notify(db, client, session.id, 'Local session ended. Send a message to reclaim this session in Matrix.', logger)
   }
 
   return { status: 200, body: { status: 'detached', action: 'released' } }
